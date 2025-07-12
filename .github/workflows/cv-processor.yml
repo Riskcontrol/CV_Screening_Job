@@ -1,0 +1,48 @@
+name: CV Text Extraction Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'URL of the CV file to process'
+        required: true
+        type: string
+      application_id:
+        description: 'Application ID for callback'
+        required: true
+        type: string
+      callback_url:
+        description: 'Webhook URL for results'
+        required: true
+        type: string
+      auth_token:
+        description: 'Authentication token'
+        required: true
+        type: string
+
+jobs:
+  extract-text:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y poppler-utils antiword
+        pip install requests PyPDF2 python-docx pdfplumber
+        
+    - name: Download and process file
+      run: |
+        python .github/scripts/process_cv.py \
+          "${{ github.event.inputs.file_url }}" \
+          "${{ github.event.inputs.application_id }}" \
+          "${{ github.event.inputs.callback_url }}" \
+          "${{ github.event.inputs.auth_token }}"
