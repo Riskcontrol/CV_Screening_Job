@@ -458,7 +458,7 @@ class CVProcessor:
             raise Exception(f"Failed to extract DOC text: {e}")
     
     def send_callback(self, extracted_text, success=True, error_message=None):
-        """Send processing results back to Laravel application"""
+        """Send processing results back to Laravel application with improved error handling"""
         print(f"Sending callback to: {self.callback_url}")
         
         # Get current timestamp
@@ -468,39 +468,100 @@ class CVProcessor:
         except:
             timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ')
         
+        # Create payload with Laravel-compatible structure
         payload = {
             'application_id': self.application_id,
-            'success': success,
-            'timestamp': timestamp
+            'status': 'success' if success else 'error',
+            'processed_at': timestamp
         }
         
         if success:
-            payload['extracted_text'] = extracted_text
-            payload['text_length'] = len(extracted_text)
+            payload['data'] = {
+                'extracted_text': extracted_text,
+                'text_length': len(extracted_text),
+                'file_type': os.path.splitext(self.temp_file_path)[1] if self.temp_file_path else 'unknown'
+            }
         else:
-            payload['error'] = error_message or "Unknown error occurred"
+            payload['error'] = {
+                'message': error_message or "Unknown error occurred",
+                'code': 'processing_failed'
+            }
         
         headers = {
             'Authorization': f'Bearer {self.auth_token}',
             'Content-Type': 'application/json',
-            'User-Agent': 'GitHub-Actions-CV-Processor/1.0'
+            'User-Agent': 'GitHub-Actions-CV-Processor/1.0',
+            'Accept': 'application/json'
         }
         
-        try:
-            response = requests.post(
-                self.callback_url,
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-            
-            response.raise_for_status()
-            print(f"Callback sent successfully. Status: {response.status_code}")
-            return True
-            
-        except Exception as e:
-            print(f"Failed to send callback: {e}")
-            return False
+        # Debug: Print payload structure (without sensitive data)
+        debug_payload = payload.copy()
+        if 'data' in debug_payload and 'extracted_text' in debug_payload['data']:
+            debug_payload['data']['extracted_text'] = f"[{len(extracted_text)} characters]"
+        print(f"Callback payload: {json.dumps(debug_payload, indent=2)}")
+        
+        # Implement retry logic for temporary failures
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Sending callback (attempt {attempt + 1}/{max_retries})...")
+                
+                response = requests.post(
+                    self.callback_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=60  # Increased timeout
+                )
+                
+                print(f"Response status: {response.status_code}")
+                print(f"Response headers: {dict(response.headers)}")
+                
+                # Log response content for debugging (truncated)
+                response_text = response.text[:500] if response.text else "No response body"
+                print(f"Response content (first 500 chars): {response_text}")
+                
+                response.raise_for_status()
+                print(f"Callback sent successfully. Status: {response.status_code}")
+                return True
+                
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response else 'Unknown'
+                response_text = e.response.text if e.response else 'No response'
+                
+                print(f"HTTP Error {status_code}: {e}")
+                print(f"Response body: {response_text}")
+                
+                # Don't retry for client errors (4xx)
+                if e.response and 400 <= e.response.status_code < 500:
+                    print("Client error - not retrying")
+                    break
+                    
+                # Retry for server errors (5xx) and network issues
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # Exponential backoff
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    
+            except requests.exceptions.Timeout as e:
+                print(f"Request timeout: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"Request error: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                break
+        
+        print("All callback attempts failed")
+        return False
     
     def cleanup(self):
         """Clean up temporary files"""
@@ -512,18 +573,38 @@ class CVProcessor:
                 print(f"Failed to clean up temporary file: {e}")
     
     def process(self):
-        """Main processing method"""
+        """Main processing method with enhanced error handling"""
         try:
             # Download the file
             if not self.download_file():
-                self.send_callback(None, False, "Failed to download CV file")
+                error_msg = "Failed to download CV file from the provided URL"
+                print(f"Error: {error_msg}")
+                self.send_callback(None, False, error_msg)
                 return False
+            
+            # Verify file was downloaded and has content
+            if not self.temp_file_path or not os.path.exists(self.temp_file_path):
+                error_msg = "Downloaded file not found or path is invalid"
+                print(f"Error: {error_msg}")
+                self.send_callback(None, False, error_msg)
+                return False
+                
+            file_size = os.path.getsize(self.temp_file_path)
+            if file_size == 0:
+                error_msg = "Downloaded file is empty (0 bytes)"
+                print(f"Error: {error_msg}")
+                self.send_callback(None, False, error_msg)
+                return False
+                
+            print(f"File downloaded successfully. Size: {file_size} bytes")
             
             # Extract text
             extracted_text = self.extract_text()
             
-            if not extracted_text.strip():
-                self.send_callback(None, False, "No text could be extracted from the CV file")
+            if not extracted_text or not extracted_text.strip():
+                error_msg = "No readable text could be extracted from the CV file"
+                print(f"Error: {error_msg}")
+                self.send_callback(None, False, error_msg)
                 return False
             
             # Log success (don't log full content for privacy)
@@ -531,11 +612,19 @@ class CVProcessor:
             print(f"Preview: {extracted_text[:100]}...")
             
             # Send success callback
-            return self.send_callback(extracted_text, True)
+            callback_success = self.send_callback(extracted_text, True)
+            
+            if not callback_success:
+                print("Warning: Processing successful but callback failed")
+                # Still return True as the core processing succeeded
+                return True
+                
+            return True
             
         except Exception as e:
-            print(f"Processing error: {e}")
-            self.send_callback(None, False, str(e))
+            error_msg = f"Unexpected processing error: {str(e)}"
+            print(f"Error: {error_msg}")
+            self.send_callback(None, False, error_msg)
             return False
         
         finally:
